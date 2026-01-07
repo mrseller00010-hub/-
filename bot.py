@@ -7,16 +7,23 @@ import re
 import time
 from datetime import datetime, timedelta
 from functools import partial
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 import psutil
 import pymysql
 from dotenv import load_dotenv
 from pymysql.cursors import DictCursor
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from Boltnew.sheerid_verifier import SheerIDVerifier as BoltnewVerifier
 from k12.sheerid_verifier import SheerIDVerifier as K12Verifier
@@ -324,6 +331,26 @@ class MySQLDatabase:
             cursor.close()
             conn.close()
 
+    def set_balance(self, user_id: int, amount: int) -> bool:
+        """Set user balance to a specific amount."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                "UPDATE users SET balance = %s WHERE user_id = %s",
+                (amount, user_id),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            logger.error("Failed to set balance: %s", e)
+            conn.rollback()
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+
     def deduct_balance(self, user_id: int, amount: int) -> bool:
         """扣除用户积分"""
         user = self.get_user(user_id)
@@ -448,6 +475,94 @@ class MySQLDatabase:
             cursor.close()
             conn.close()
 
+    def get_recent_verifications(self, limit: int = 10) -> List[Dict]:
+        """Get recent verification records."""
+        conn = self.get_connection()
+        cursor = conn.cursor(DictCursor)
+
+        try:
+            cursor.execute(
+                """
+                SELECT * FROM verifications
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return list(cursor.fetchall())
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_verification_status_counts(self) -> Dict[str, int]:
+        """Get verification counts grouped by status."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute("SELECT status, COUNT(*) FROM verifications GROUP BY status")
+            rows = cursor.fetchall()
+            return {row[0]: row[1] for row in rows}
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_total_users(self) -> int:
+        """Get total user count."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute("SELECT COUNT(*) FROM users")
+            result = cursor.fetchone()
+            return int(result[0]) if result else 0
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_total_verifications(self) -> int:
+        """Get total verification count."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute("SELECT COUNT(*) FROM verifications")
+            result = cursor.fetchone()
+            return int(result[0]) if result else 0
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_verifications_last_days(self, days: int = 1) -> int:
+        """Get verification count in the last N days."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                "SELECT COUNT(*) FROM verifications WHERE created_at >= NOW() - INTERVAL %s DAY",
+                (days,),
+            )
+            result = cursor.fetchone()
+            return int(result[0]) if result else 0
+        finally:
+            cursor.close()
+            conn.close()
+
+    def health_check(self) -> bool:
+        """Check database connectivity."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute("SELECT 1")
+            return True
+        except Exception as e:
+            logger.error("Database health check failed: %s", e)
+            return False
+        finally:
+            cursor.close()
+            conn.close()
     def create_card_key(
         self,
         key_code: str,
@@ -698,6 +813,7 @@ def get_help_message(is_admin: bool = False) -> str:
     if is_admin:
         msg += (
             "\nAdmin commands:\n"
+            "/admin - Open admin panel\n"
             "/addbalance <user_id> <credits> - Add credits\n"
             "/block <user_id> - Block user\n"
             "/white <user_id> - Unblock user\n"
@@ -734,6 +850,95 @@ def get_verify_usage_message(command: str, service_name: str) -> str:
         f"4. Submit with {command}"
     )
 
+
+def build_admin_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("👤 User Management", callback_data="admin:user")],
+            [InlineKeyboardButton("📢 Broadcast Tools", callback_data="admin:broadcast")],
+            [InlineKeyboardButton("📜 Verification Logs", callback_data="admin:logs")],
+            [InlineKeyboardButton("📊 Stats & Charts", callback_data="admin:stats")],
+            [InlineKeyboardButton("🔑 Key Management", callback_data="admin:keys")],
+            [InlineKeyboardButton("🧪 DB Monitor", callback_data="admin:db")],
+            [InlineKeyboardButton("❌ Close", callback_data="admin:close")],
+        ]
+    )
+
+
+def build_user_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🚫 Block User", callback_data="admin:user:block"),
+                InlineKeyboardButton("✅ Unblock User", callback_data="admin:user:unblock"),
+            ],
+            [
+                InlineKeyboardButton("➕ Add Credits", callback_data="admin:user:addcredits"),
+                InlineKeyboardButton("🎯 Set Balance", callback_data="admin:user:setbalance"),
+            ],
+            [InlineKeyboardButton("🔍 User Info", callback_data="admin:user:info")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="admin:back")],
+        ]
+    )
+
+
+def build_logs_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🕒 Recent Logs", callback_data="admin:logs:recent")],
+            [InlineKeyboardButton("👤 Logs by User", callback_data="admin:logs:user")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="admin:back")],
+        ]
+    )
+
+
+def build_keys_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("➕ Create Key", callback_data="admin:keys:create")],
+            [InlineKeyboardButton("📋 List Keys", callback_data="admin:keys:list")],
+            [InlineKeyboardButton("🔎 Key Info", callback_data="admin:keys:info")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="admin:back")],
+        ]
+    )
+
+
+def build_broadcast_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📝 New Broadcast", callback_data="admin:broadcast:new")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="admin:back")],
+        ]
+    )
+
+
+def build_db_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Health Check", callback_data="admin:db:health")],
+            [InlineKeyboardButton("📦 Table Counts", callback_data="admin:db:counts")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="admin:back")],
+        ]
+    )
+
+
+async def send_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    if update.message:
+        await update.message.reply_text(text, reply_markup=build_admin_menu())
+    elif update.callback_query:
+        await update.callback_query.message.edit_text(text, reply_markup=build_admin_menu())
+
+
+async def send_admin_submenu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    menu: InlineKeyboardMarkup,
+) -> None:
+    if update.message:
+        await update.message.reply_text(text, reply_markup=menu)
+    elif update.callback_query:
+        await update.callback_query.message.edit_text(text, reply_markup=menu)
 
 def _calculate_max_concurrency() -> int:
     """根据系统资源计算最大并发数"""
@@ -978,6 +1183,26 @@ def _generate_email(first_name: str, last_name: str) -> str:
     domain = random.choice(["gmail.com", "outlook.com", "yahoo.com"])
     suffix = random.randint(10, 9999)
     return f"{first_name.lower()}.{last_name.lower()}{suffix}@{domain}"
+
+
+async def run_with_retries(
+    task: Callable[[], Any],
+    retries: int = 2,
+    base_delay: float = 1.0,
+    max_delay: float = 6.0,
+) -> Any:
+    """Run a callable with retries and exponential backoff."""
+    attempt = 0
+    while True:
+        try:
+            return await asyncio.to_thread(task)
+        except Exception as e:
+            if attempt >= retries:
+                raise
+            sleep_for = min(max_delay, base_delay * (2**attempt))
+            logger.warning("Retrying after error: %s (sleep %.1fs)", e, sleep_for)
+            await asyncio.sleep(sleep_for)
+            attempt += 1
 
 
 class MilitaryVeteranVerifier:
@@ -1278,7 +1503,7 @@ async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE, db:
 
     try:
         verifier = OneVerifier(verification_id)
-        result = await asyncio.to_thread(verifier.verify)
+        result = await run_with_retries(verifier.verify)
 
         db.add_verification(
             user_id,
@@ -1352,7 +1577,7 @@ async def verify2_command(update: Update, context: ContextTypes.DEFAULT_TYPE, db
 
     try:
         verifier = K12Verifier(verification_id)
-        result = await asyncio.to_thread(verifier.verify)
+        result = await run_with_retries(verifier.verify)
 
         db.add_verification(
             user_id,
@@ -1430,7 +1655,7 @@ async def verify3_command(update: Update, context: ContextTypes.DEFAULT_TYPE, db
     try:
         async with semaphore:
             verifier = SpotifyVerifier(verification_id)
-            result = await asyncio.to_thread(verifier.verify)
+            result = await run_with_retries(verifier.verify)
 
         db.add_verification(
             user_id,
@@ -1510,7 +1735,7 @@ async def verify4_command(update: Update, context: ContextTypes.DEFAULT_TYPE, db
         async with semaphore:
             # 第1步：提交文档
             verifier = BoltnewVerifier(url, verification_id=verification_id)
-            result = await asyncio.to_thread(verifier.verify)
+            result = await run_with_retries(verifier.verify)
 
         if not result.get("success"):
             # 提交失败，退款
@@ -1700,7 +1925,7 @@ async def verify5_command(update: Update, context: ContextTypes.DEFAULT_TYPE, db
     try:
         async with semaphore:
             verifier = YouTubeVerifier(verification_id)
-            result = await asyncio.to_thread(verifier.verify)
+            result = await run_with_retries(verifier.verify)
 
         db.add_verification(
             user_id,
@@ -1778,7 +2003,7 @@ async def verify6_command(update: Update, context: ContextTypes.DEFAULT_TYPE, db
     try:
         async with semaphore:
             verifier = MilitaryVeteranVerifier(verification_id)
-            result = await asyncio.to_thread(verifier.verify)
+            result = await run_with_retries(verifier.verify)
 
         db.add_verification(
             user_id,
@@ -1884,6 +2109,339 @@ async def getV4Code_command(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             "Please try again later or contact admin."
         )
 
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE, db: Database):
+    """Open the admin panel."""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text("You do not have permission to use this command.")
+        return
+
+    context.user_data["admin_action"] = None
+    await send_admin_menu(update, context, "🛠️ Admin Panel\nSelect an option:")
+
+
+async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, db: Database):
+    """Handle admin panel callbacks."""
+    query = update.callback_query
+    await query.answer()
+
+    if update.effective_user.id != ADMIN_USER_ID:
+        await query.message.reply_text("You do not have permission to use this command.")
+        return
+
+    data = query.data
+    context.user_data["admin_action"] = None
+
+    if data == "admin:back":
+        await send_admin_menu(update, context, "🛠️ Admin Panel\nSelect an option:")
+        return
+
+    if data == "admin:close":
+        await query.message.delete()
+        return
+
+    if data == "admin:user":
+        await send_admin_submenu(update, context, "👤 User Management", build_user_menu())
+        return
+
+    if data == "admin:broadcast":
+        await send_admin_submenu(update, context, "📢 Broadcast Tools", build_broadcast_menu())
+        return
+
+    if data == "admin:logs":
+        await send_admin_submenu(update, context, "📜 Verification Logs", build_logs_menu())
+        return
+
+    if data == "admin:keys":
+        await send_admin_submenu(update, context, "🔑 Key Management", build_keys_menu())
+        return
+
+    if data == "admin:db":
+        await send_admin_submenu(update, context, "🧪 DB Monitor", build_db_menu())
+        return
+
+    if data == "admin:stats":
+        total_users = db.get_total_users()
+        total_verifications = db.get_total_verifications()
+        recent_verifications = db.get_verifications_last_days(1)
+        status_counts = db.get_verification_status_counts()
+        success = status_counts.get("success", 0)
+        failed = status_counts.get("failed", 0)
+        pending = status_counts.get("pending", 0)
+
+        message = (
+            "📊 Stats Summary\n\n"
+            f"Total users: {total_users}\n"
+            f"Total verifications: {total_verifications}\n"
+            f"Verifications (last 24h): {recent_verifications}\n"
+            f"✅ Success: {success}\n"
+            f"❌ Failed: {failed}\n"
+            f"⏳ Pending: {pending}\n"
+        )
+        await query.message.reply_text(message)
+        return
+
+    if data == "admin:logs:recent":
+        logs = db.get_recent_verifications(10)
+        if not logs:
+            await query.message.reply_text("No recent verification logs.")
+            return
+        lines = ["📜 Recent Verifications"]
+        for log in logs:
+            lines.append(
+                f"- {log['created_at']} | {log['user_id']} | {log['verification_type']} | {log['status']}"
+            )
+        await query.message.reply_text("\n".join(lines))
+        return
+
+    if data == "admin:logs:user":
+        context.user_data["admin_action"] = "logs_user"
+        await query.message.reply_text("Send: <user_id> to view verification logs.")
+        return
+
+    if data == "admin:user:block":
+        context.user_data["admin_action"] = "block_user"
+        await query.message.reply_text("Send: <user_id> to block.")
+        return
+
+    if data == "admin:user:unblock":
+        context.user_data["admin_action"] = "unblock_user"
+        await query.message.reply_text("Send: <user_id> to unblock.")
+        return
+
+    if data == "admin:user:addcredits":
+        context.user_data["admin_action"] = "add_credits"
+        await query.message.reply_text("Send: <user_id> <credits> to add.")
+        return
+
+    if data == "admin:user:setbalance":
+        context.user_data["admin_action"] = "set_balance"
+        await query.message.reply_text("Send: <user_id> <credits> to set balance.")
+        return
+
+    if data == "admin:user:info":
+        context.user_data["admin_action"] = "user_info"
+        await query.message.reply_text("Send: <user_id> to view user info.")
+        return
+
+    if data == "admin:broadcast:new":
+        context.user_data["admin_action"] = "broadcast"
+        await query.message.reply_text(
+            "Send the broadcast message text. Use {username} to personalize."
+        )
+        return
+
+    if data == "admin:keys:create":
+        context.user_data["admin_action"] = "key_create"
+        await query.message.reply_text(
+            "Send: <key> <credits> [uses] [days]\nExample: vip100 50 10 30"
+        )
+        return
+
+    if data == "admin:keys:list":
+        keys = db.get_all_card_keys()
+        if not keys:
+            await query.message.reply_text("No keys found.")
+            return
+        lines = ["🔑 Key List (first 20):"]
+        for key in keys[:20]:
+            lines.append(
+                f"- {key['key_code']} | {key['balance']} credits | {key['current_uses']}/{key['max_uses']} uses"
+            )
+        await query.message.reply_text("\n".join(lines))
+        return
+
+    if data == "admin:keys:info":
+        context.user_data["admin_action"] = "key_info"
+        await query.message.reply_text("Send: <key> to view key info.")
+        return
+
+    if data == "admin:db:health":
+        ok = db.health_check()
+        await query.message.reply_text("✅ DB healthy." if ok else "❌ DB health check failed.")
+        return
+
+    if data == "admin:db:counts":
+        total_users = db.get_total_users()
+        total_verifications = db.get_total_verifications()
+        message = (
+            "📦 Table Counts\n\n"
+            f"Users: {total_users}\n"
+            f"Verifications: {total_verifications}\n"
+            f"Keys: {len(db.get_all_card_keys())}"
+        )
+        await query.message.reply_text(message)
+        return
+
+
+async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE, db: Database):
+    """Handle follow-up admin input messages."""
+    if update.effective_user.id != ADMIN_USER_ID:
+        return
+
+    action = context.user_data.get("admin_action")
+    if not action:
+        return
+
+    text = update.message.text.strip()
+    context.user_data["admin_action"] = None
+
+    if action == "block_user":
+        try:
+            target_user_id = int(text)
+        except ValueError:
+            await update.message.reply_text("Invalid user ID.")
+            return
+        if db.block_user(target_user_id):
+            await update.message.reply_text(f"✅ User {target_user_id} has been blocked.")
+        else:
+            await update.message.reply_text("Operation failed. Please try again later.")
+        return
+
+    if action == "unblock_user":
+        try:
+            target_user_id = int(text)
+        except ValueError:
+            await update.message.reply_text("Invalid user ID.")
+            return
+        if db.unblock_user(target_user_id):
+            await update.message.reply_text(f"✅ User {target_user_id} has been unblocked.")
+        else:
+            await update.message.reply_text("Operation failed. Please try again later.")
+        return
+
+    if action == "add_credits":
+        parts = text.split()
+        if len(parts) != 2:
+            await update.message.reply_text("Usage: <user_id> <credits>")
+            return
+        try:
+            target_user_id = int(parts[0])
+            amount = int(parts[1])
+        except ValueError:
+            await update.message.reply_text("Invalid parameters.")
+            return
+        if db.add_balance(target_user_id, amount):
+            await update.message.reply_text(
+                f"✅ Added {amount} credits to user {target_user_id}."
+            )
+        else:
+            await update.message.reply_text("Operation failed. Please try again later.")
+        return
+
+    if action == "set_balance":
+        parts = text.split()
+        if len(parts) != 2:
+            await update.message.reply_text("Usage: <user_id> <credits>")
+            return
+        try:
+            target_user_id = int(parts[0])
+            amount = int(parts[1])
+        except ValueError:
+            await update.message.reply_text("Invalid parameters.")
+            return
+        if db.set_balance(target_user_id, amount):
+            await update.message.reply_text(
+                f"✅ Set balance for user {target_user_id} to {amount}."
+            )
+        else:
+            await update.message.reply_text("Operation failed. Please try again later.")
+        return
+
+    if action == "user_info":
+        try:
+            target_user_id = int(text)
+        except ValueError:
+            await update.message.reply_text("Invalid user ID.")
+            return
+        user = db.get_user(target_user_id)
+        if not user:
+            await update.message.reply_text("User not found.")
+            return
+        await update.message.reply_text(
+            "👤 User Info\n\n"
+            f"ID: {user['user_id']}\n"
+            f"Username: @{user.get('username')}\n"
+            f"Name: {user.get('full_name')}\n"
+            f"Balance: {user.get('balance')}\n"
+            f"Blocked: {bool(user.get('is_blocked'))}"
+        )
+        return
+
+    if action == "broadcast":
+        user_ids = db.get_all_user_ids()
+        success, failed = 0, 0
+        status_msg = await update.message.reply_text(
+            f"📢 Starting broadcast to {len(user_ids)} users..."
+        )
+        for uid in user_ids:
+            try:
+                username = ""
+                user = db.get_user(uid)
+                if user and user.get("username"):
+                    username = user["username"]
+                personalized = text.replace("{username}", username)
+                await context.bot.send_message(chat_id=uid, text=personalized)
+                success += 1
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                logger.warning("Broadcast failed to %s: %s", uid, e)
+                failed += 1
+        await status_msg.edit_text(f"✅ Broadcast complete!\nSent: {success}\nFailed: {failed}")
+        return
+
+    if action == "logs_user":
+        try:
+            target_user_id = int(text)
+        except ValueError:
+            await update.message.reply_text("Invalid user ID.")
+            return
+        logs = db.get_user_verifications(target_user_id)
+        if not logs:
+            await update.message.reply_text("No verification logs for this user.")
+            return
+        lines = [f"📜 Logs for user {target_user_id} (latest 10):"]
+        for log in logs[:10]:
+            lines.append(
+                f"- {log['created_at']} | {log['verification_type']} | {log['status']}"
+            )
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if action == "key_create":
+        parts = text.split()
+        if len(parts) < 2:
+            await update.message.reply_text("Usage: <key> <credits> [uses] [days]")
+            return
+        key_code = parts[0]
+        try:
+            balance = int(parts[1])
+            max_uses = int(parts[2]) if len(parts) > 2 else 1
+            expire_days = int(parts[3]) if len(parts) > 3 else None
+        except ValueError:
+            await update.message.reply_text("Invalid parameters.")
+            return
+        if db.create_card_key(key_code, balance, ADMIN_USER_ID, max_uses, expire_days):
+            await update.message.reply_text("✅ Key created successfully.")
+        else:
+            await update.message.reply_text("Key creation failed or already exists.")
+        return
+
+    if action == "key_info":
+        key_code = text.strip()
+        key = db.get_card_key_info(key_code)
+        if not key:
+            await update.message.reply_text("Key not found.")
+            return
+        await update.message.reply_text(
+            "🔑 Key Info\n\n"
+            f"Key: {key['key_code']}\n"
+            f"Credits: {key['balance']}\n"
+            f"Uses: {key['current_uses']}/{key['max_uses']}\n"
+            f"Expires: {key['expire_at'] or 'never'}"
+        )
+        return
 
 async def addbalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE, db: Database):
     """处理 /addbalance 命令 - 管理员增加积分"""
@@ -2182,6 +2740,7 @@ def main():
     application.add_handler(CommandHandler("getV4Code", partial(getV4Code_command, db=db)))
 
     # 注册管理员命令
+    application.add_handler(CommandHandler("admin", partial(admin_command, db=db)))
     application.add_handler(CommandHandler("addbalance", partial(addbalance_command, db=db)))
     application.add_handler(CommandHandler("block", partial(block_command, db=db)))
     application.add_handler(CommandHandler("white", partial(white_command, db=db)))
@@ -2189,6 +2748,10 @@ def main():
     application.add_handler(CommandHandler("genkey", partial(genkey_command, db=db)))
     application.add_handler(CommandHandler("listkeys", partial(listkeys_command, db=db)))
     application.add_handler(CommandHandler("broadcast", partial(broadcast_command, db=db)))
+    application.add_handler(CallbackQueryHandler(partial(handle_admin_callback, db=db)))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, partial(handle_admin_input, db=db))
+    )
 
     # 注册错误处理器
     application.add_error_handler(error_handler)
